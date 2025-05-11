@@ -1,0 +1,332 @@
+package net.ypresto.androidtranscoder.example;
+
+import android.util.Log;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
+import java.util.ArrayList;
+import java.util.List;
+
+public class MP4MoovOptimizer {
+    private static final String TAG = "MP4MoovOptimizer";
+
+    public interface OptimizerListener {
+        void onProgress(float progress);
+        void onSuccess(File outputFile);
+        void onError(Exception e);
+    }
+
+    private static class Atom {
+        String type;
+        long position;
+        long size;
+
+        Atom(String type, long position, long size) {
+            this.type = type;
+            this.position = position;
+            this.size = size;
+        }
+    }
+
+    public static void optimize(final File inputFile, final File outputFile, final OptimizerListener listener) {
+        new Thread(() -> {
+            try {
+                if (!outputFile.getParentFile().exists()) {
+                    outputFile.getParentFile().mkdirs();
+                }
+                if (outputFile.exists()) {
+                    outputFile.delete();
+                }
+
+                if (isOptimized(inputFile)) {
+                    copyFile(inputFile, outputFile);
+                    if (listener != null) listener.onSuccess(outputFile);
+                    return;
+                }
+
+                List<Atom> atoms = parseAtoms(inputFile);
+                Atom moovAtom = null;
+                Atom mdatAtom = null;
+                Atom ftypAtom = null;
+
+                for (Atom atom : atoms) {
+                    switch (atom.type) {
+                        case "moov": moovAtom = atom; break;
+                        case "mdat": mdatAtom = atom; break;
+                        case "ftyp": ftypAtom = atom; break;
+                    }
+                }
+
+                if (moovAtom == null || mdatAtom == null) {
+                    throw new IOException("Missing required atoms (moov/mdat)");
+                }
+
+                try (RandomAccessFile rafInput = new RandomAccessFile(inputFile, "r");
+                     FileOutputStream fos = new FileOutputStream(outputFile)) {
+
+                    // Calculate new mdat position
+                    long newMdatPosition = 0;
+                    if (ftypAtom != null) {
+                        newMdatPosition += ftypAtom.size + 8;
+                    }
+                    newMdatPosition += moovAtom.size + 8;
+
+                    // Calculate mdat shift
+                    long mdatShift = newMdatPosition - mdatAtom.position;
+
+                    // Read and adjust moov atom
+                    byte[] moovBytes = new byte[(int) moovAtom.size + 8];
+                    rafInput.seek(moovAtom.position - 8);
+                    rafInput.readFully(moovBytes);
+                    adjustChunkOffsetsNonRecursive(moovBytes, mdatShift);
+
+                    // Write atoms
+                    long bytesWritten = 0;
+                    long totalBytes = inputFile.length();
+
+                    // Write ftyp first if exists
+                    if (ftypAtom != null) {
+                        writeAtom(rafInput, fos, ftypAtom);
+                        bytesWritten += ftypAtom.size + 8;
+                        updateProgress(listener, bytesWritten, totalBytes);
+                    }
+
+                    // Write adjusted moov
+                    fos.write(moovBytes);
+                    bytesWritten += moovBytes.length;
+                    updateProgress(listener, bytesWritten, totalBytes);
+
+                    // Write remaining atoms
+                    for (Atom atom : atoms) {
+                        if (!"ftyp".equals(atom.type) && !"moov".equals(atom.type)) {
+                            writeAtom(rafInput, fos, atom);
+                            bytesWritten += atom.size + 8;
+                            updateProgress(listener, bytesWritten, totalBytes);
+                        }
+                    }
+
+                    if (listener != null) {
+                        listener.onProgress(1.0f);
+                        listener.onSuccess(outputFile);
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Optimization failed", e);
+                if (listener != null) listener.onError(e);
+            }
+        }).start();
+    }
+
+    private static void adjustChunkOffsetsNonRecursive(byte[] moovBytes, long shift) {
+        if (shift == 0) return;
+
+        ByteBuffer buffer = ByteBuffer.wrap(moovBytes);
+        buffer.order(ByteOrder.BIG_ENDIAN);
+
+        // Stack for tracking container atoms (position and limit)
+        List<Integer> stack = new ArrayList<>();
+
+        buffer.position(8); // Skip moov header
+
+        while (true) {
+            if (buffer.remaining() < 8) break;
+
+            int startPos = buffer.position();
+            int size = buffer.getInt();
+            if (size < 8) break;
+
+            byte[] typeBytes = new byte[4];
+            buffer.get(typeBytes);
+            String type = new String(typeBytes);
+
+            if ("stco".equals(type)) {
+                buffer.position(buffer.position() + 4); // Skip version/flags
+                int count = buffer.getInt();
+                for (int i = 0; i < count; i++) {
+                    int offset = buffer.getInt();
+                    buffer.position(buffer.position() - 4);
+                    buffer.putInt((int)(offset + shift));
+                }
+            } else if ("co64".equals(type)) {
+                buffer.position(buffer.position() + 4); // Skip version/flags
+                int count = buffer.getInt();
+                for (int i = 0; i < count; i++) {
+                    long offset = buffer.getLong();
+                    buffer.position(buffer.position() - 8);
+                    buffer.putLong(offset + shift);
+                }
+            } else if (isContainerAtom(type)) {
+                // Push current position and set new limit
+                stack.add(buffer.position());
+                stack.add(buffer.limit());
+                buffer.limit(startPos + size);
+                continue;
+            }
+
+            // Move to next atom
+            buffer.position(startPos + size);
+
+            // Handle stack (container atoms)
+            while (buffer.position() >= buffer.limit() && !stack.isEmpty()) {
+                buffer.limit(stack.remove(stack.size() - 1));
+                buffer.position(stack.remove(stack.size() - 1));
+            }
+        }
+    }
+
+    private static boolean isContainerAtom(String type) {
+        return "moov".equals(type) || "trak".equals(type) || "mdia".equals(type) ||
+                "minf".equals(type) || "stbl".equals(type);
+    }
+
+    private static void writeAtom(RandomAccessFile raf, FileOutputStream fos, Atom atom) throws IOException {
+        raf.seek(atom.position - 8);
+        byte[] buffer = new byte[8192];
+        long remaining = atom.size + 8;
+
+        while (remaining > 0) {
+            int read = (int) Math.min(buffer.length, remaining);
+            raf.readFully(buffer, 0, read);
+            fos.write(buffer, 0, read);
+            remaining -= read;
+        }
+    }
+
+    private static void updateProgress(OptimizerListener listener, long bytesWritten, long totalBytes) {
+        if (listener != null) {
+            float progress = Math.min(1.0f, (float) bytesWritten / totalBytes);
+            listener.onProgress(progress);
+        }
+    }
+
+    // Keep the original implementations of these methods:
+    // private static boolean isOptimized(File file)
+    // private static List<Atom> parseAtoms(File file)
+    // private static void copyFile(File src, File dst)
+
+    /**
+     * Check if the MP4 file is already optimized (moov atom before mdat)
+     */
+    public static boolean isOptimized(File file) throws IOException {
+        try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
+            ByteBuffer headerBuffer = ByteBuffer.allocate(8);
+            headerBuffer.order(ByteOrder.BIG_ENDIAN);
+
+            long fileSize = raf.length();
+            long position = 0;
+
+            // Find atom positions to determine if moov is before mdat
+            long moovPosition = -1;
+            long mdatPosition = -1;
+
+            while (position < fileSize - 8) {
+                raf.seek(position);
+                headerBuffer.clear();
+                raf.getChannel().read(headerBuffer);
+                headerBuffer.flip();
+
+                long atomSize = headerBuffer.getInt() & 0xFFFFFFFFL;
+                byte[] typeBytes = new byte[4];
+                headerBuffer.get(typeBytes);
+                String atomType = new String(typeBytes);
+
+                if (atomSize < 8) {
+                    // Invalid atom size
+                    break;
+                }
+
+                if ("moov".equals(atomType)) {
+                    moovPosition = position;
+                } else if ("mdat".equals(atomType)) {
+                    mdatPosition = position;
+
+                    // If we found moov before, and now found mdat, file is optimized
+                    if (moovPosition != -1 && moovPosition < mdatPosition) {
+                        return true;
+                    }
+
+                    // If we found mdat first, we need to optimize
+                    if (moovPosition == -1) {
+                        return false;
+                    }
+                }
+
+                // Move to next atom
+                position += atomSize;
+            }
+
+            // If we found moov but not mdat, or neither, assume it needs optimization
+            return false;
+        }
+    }
+
+    /**
+     * Parse all atoms in the MP4 file
+     */
+    private static List<Atom> parseAtoms(File file) throws IOException {
+        List<Atom> atoms = new ArrayList<>();
+
+        try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
+            ByteBuffer headerBuffer = ByteBuffer.allocate(8);
+            headerBuffer.order(ByteOrder.BIG_ENDIAN);
+
+            long fileSize = raf.length();
+            long position = 0;
+
+            while (position < fileSize - 8) {
+                raf.seek(position);
+                headerBuffer.clear();
+                raf.getChannel().read(headerBuffer);
+                headerBuffer.flip();
+
+                long atomSize = headerBuffer.getInt() & 0xFFFFFFFFL;
+                byte[] typeBytes = new byte[4];
+                headerBuffer.get(typeBytes);
+                String atomType = new String(typeBytes);
+
+                if (atomSize < 8) {
+                    // Invalid atom size
+                    break;
+                }
+
+                if (atomSize == 1) {
+                    // Extended size atom (64-bit)
+                    ByteBuffer extSizeBuffer = ByteBuffer.allocate(8);
+                    extSizeBuffer.order(ByteOrder.BIG_ENDIAN);
+                    raf.getChannel().read(extSizeBuffer);
+                    extSizeBuffer.flip();
+                    atomSize = extSizeBuffer.getLong();
+                }
+
+                atoms.add(new Atom(atomType, position + 8, atomSize - 8));
+
+                // Move to next atom
+                if (atomSize == 0) {
+                    // Atom extends to end of file
+                    break;
+                }
+                position += atomSize;
+            }
+        }
+
+        return atoms;
+    }
+
+    /**
+     * Copy a file (used when input is already optimized)
+     */
+    private static void copyFile(File src, File dst) throws IOException {
+        try (FileInputStream in = new FileInputStream(src);
+             FileOutputStream out = new FileOutputStream(dst)) {
+            FileChannel inChannel = in.getChannel();
+            FileChannel outChannel = out.getChannel();
+            inChannel.transferTo(0, inChannel.size(), outChannel);
+        }
+    }
+}

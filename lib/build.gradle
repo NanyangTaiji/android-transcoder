@@ -1,40 +1,36 @@
-buildscript {
-    repositories {
-        jcenter()
-    }
-    dependencies {
-        classpath 'com.novoda:bintray-release:0.2.4'
-    }
+plugins {
+    id 'com.android.library'
+    id 'com.vanniktech.maven.publish' version '0.25.3' // Modern replacement for bintray-release
 }
 
-apply plugin: 'com.android.library'
-apply plugin: 'bintray-release'
-
 android {
-    compileSdkVersion 24
-    buildToolsVersion '25.0.2'
+    namespace 'net.ypresto.androidtranscoder' // required for AGP 7+
+    compileSdk = 34
 
     defaultConfig {
-        minSdkVersion 18
-        targetSdkVersion 24
+        minSdk = 18
+        targetSdk = 34
     }
 
     buildTypes {
         release {
-            zipAlignEnabled true
             minifyEnabled false
             shrinkResources false
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
 }
 
-publish {
-    groupId = 'net.ypresto.androidtranscoder'
-    artifactId = 'android-transcoder'
-    version = '0.3.0'
-    licences = ['Apache-2.0']
-    website = 'https://github.com/ypresto/android-transcoder'
-    autoPublish = false
-    dryRun = false
+mavenPublishing {
+    coordinates("net.ypresto.androidtranscoder", "android-transcoder", "0.3.0")
+    pom {
+        licenses {
+            license {
+                name.set("The Apache License, Version 2.0")
+                url.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
+            }
+        }
+        url.set("https://github.com/ypresto/android-transcoder")
+    }
 }
+
